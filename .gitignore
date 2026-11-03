@@ -1,0 +1,6 @@
+.scratch*/
+__pycache__/
+*.gguf
+*.egg-info/
+build/
+llama.cpp/

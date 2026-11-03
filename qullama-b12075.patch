@@ -1,0 +1,299 @@
+diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
+index 40f6083..8a1aa7c 100644
+--- a/src/llama-arch.cpp
++++ b/src/llama-arch.cpp
+@@ -175,6 +175,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
+     { LLM_ARCH_K2_HORIZON,       "k2-horizon"       },
+     { LLM_ARCH_BEAM,             "beam"             },
+     { LLM_ARCH_KOLIBRI1,         "kolibri1"         },
++    { LLM_ARCH_QGATE,            "qgate"            },
+     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
+ };
+ 
+@@ -842,6 +843,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
+     { LLM_TENSOR_LILICORR_ANCHOR_OUT_HEAD,               "lilicorr.anchor_out_head" },
+     { LLM_TENSOR_ATTN_V_GATE,                            "blk.%d.attn_v_gate" },
+     { LLM_TENSOR_ATTN_V_EXPS,                            "blk.%d.attn_v_exps" },
++    { LLM_TENSOR_QGATE,                                  "blk.%d.qgate" },
++    { LLM_TENSOR_QGATE_META,                             "blk.%d.qgate_meta" },
+ };
+ 
+ // declare information about the model weight tensors:
+@@ -1198,6 +1201,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
+ 
+     {LLM_TENSOR_ATTN_V_GATE,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+     {LLM_TENSOR_ATTN_V_EXPS,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
++    {LLM_TENSOR_QGATE,                      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MAP_CUSTOM3}},
++    {LLM_TENSOR_QGATE_META,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MAP_CUSTOM3}},
+ };
+ 
+ LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
+diff --git a/src/llama-arch.h b/src/llama-arch.h
+index b98be40..cfb4a04 100644
+--- a/src/llama-arch.h
++++ b/src/llama-arch.h
+@@ -179,6 +179,7 @@ enum llm_arch {
+     LLM_ARCH_BEAM,
+     LLM_ARCH_KOLIBRI1,
+     LLM_ARCH_LIMITE,
++    LLM_ARCH_QGATE,
+     LLM_ARCH_UNKNOWN,
+ };
+ 
+@@ -847,6 +848,8 @@ enum llm_tensor {
+     LLM_TENSOR_LILICORR_ANCHOR_OUT_HEAD,
+     LLM_TENSOR_ATTN_V_GATE,
+     LLM_TENSOR_ATTN_V_EXPS,
++    LLM_TENSOR_QGATE,
++    LLM_TENSOR_QGATE_META,
+ };
+ 
+ 
+diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
+index 485483b..042e819 100644
+--- a/src/llama-model-loader.cpp
++++ b/src/llama-model-loader.cpp
+@@ -1062,6 +1062,12 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
+             {
+                 op_tensor = ggml_scale(ctx, w, 1.0f);
+             } break;
++        case GGML_OP_MAP_CUSTOM3:
++            {
++                ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w->ne[0], 1);
++                ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
++                op_tensor = ggml_map_custom3(ctx, a, w, b, [](ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int, int, void *) {}, GGML_N_TASKS_MAX, nullptr);
++            } break;
+         default:
+             GGML_ABORT("%s: missing test for op %s for tensor %s", __func__, ggml_op_name(op), w->name);
+     }
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 7529f55..22bca07 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -46,6 +46,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
+             return new llama_model_clip(params);
+         case LLM_ARCH_LLAMA:
+             return new llama_model_llama(params);
++        case LLM_ARCH_QGATE:
++            return new llama_model_qgate(params);
+         case LLM_ARCH_LLAMA4:
+             return new llama_model_llama4(params);
+         case LLM_ARCH_LLAMA_EMBED:
+diff --git a/src/models/models.h b/src/models/models.h
+index 1fc7cae..e1e32d6 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -183,6 +183,30 @@ struct llama_model_llama : public llama_model_base {
+ };
+ 
+ 
++// qgate: a "model" whose layers are quantum gates applied to a state vector.
++// The state is the embedding of a single token, layout [Re(2^n); Im(2^n)] (n_embd = 2^(n+1)).
++// Each layer applies one gate: blk.i.qgate.weight (F32 [gate_dim, gate_dim], top-left
++// 2^(k+1) x 2^(k+1) block = real form of the complex 2^k x 2^k gate) and
++// blk.i.qgate_meta (I32 [meta_dim]: [k, n_controls, t0..t_{k-1}, c0..c_{m-1}]).
++struct llama_model_qgate : public llama_model_base {
++    llama_model_qgate(const struct llama_model_params & params) : llama_model_base(params) {}
++    void load_arch_hparams(llama_model_loader & ml) override;
++    void load_arch_tensors(llama_model_loader & ml) override;
++
++    uint32_t gate_dim = 0; // padded square size of every blk.i.qgate.weight
++    uint32_t meta_dim = 0; // padded length of every blk.i.qgate_meta
++
++    std::vector<ggml_tensor *> qgate;
++    std::vector<ggml_tensor *> qgate_meta;
++
++    struct graph : public llm_graph_context {
++        graph(const llama_model & model, const llm_graph_params & params);
++    };
++
++    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
++};
++
++
+ struct llama_model_llama4 : public llama_model_base {
+     llama_model_llama4(const struct llama_model_params & params) : llama_model_base(params) {}
+     void load_arch_hparams(llama_model_loader & ml) override;
+diff --git a/src/models/qgate.cpp b/src/models/qgate.cpp
+new file mode 100644
+index 0000000..83420c0
+--- /dev/null
++++ b/src/models/qgate.cpp
+@@ -0,0 +1,177 @@
++#include "models.h"
++
++#include <vector>
++
++// ggml-quants.h is private to ggml; forward-declare the public dequant entry
++// points (C linkage, symbols exported by ggml-base)
++struct block_q8_0;
++struct block_q4_0;
++extern "C" {
++    void dequantize_row_q8_0(const block_q8_0 * x, float * y, int64_t k);
++    void dequantize_row_q4_0(const block_q4_0 * x, float * y, int64_t k);
++}
++
++// ---------------------------------------------------------------------------
++// qgate custom kernel (runs through ggml_map_custom3, no ggml changes needed)
++//
++// dst->src[0] = state : F32, ne = [2d, n_tokens]; per column: [Re(d); Im(d)]
++// dst->src[1] = gate  : F32, ne = [gate_dim, gate_dim]; top-left g x g block (g = 2^(k+1))
++//                     holds the real block matrix M = [[Ur, -Ui], [Ui, Ur]] of the
++//                     complex 2^k x 2^k gate, row-major: M[o*gate_dim + i]
++// dst->src[2] = meta  : I32, [k, n_controls, t0..t_{k-1}, c0..c_{m-1}]
++//
++// For each basis index x whose target bits are all 0 (block base), gather the
++// block amplitudes, multiply by M, scatter back. Blocks whose control bits are
++// not all 1 are copied unchanged. Qubit i = bit i of the basis index.
++// ---------------------------------------------------------------------------
++// dequantize a gate weight tensor (any supported type) into a row-major F32 buffer
++static void qgate_dequant_gate(const ggml_tensor * g, std::vector<float> & out) {
++    const int64_t ne0 = g->ne[0], ne1 = g->ne[1];
++    const int64_t n = ne0 * ne1;
++    out.resize(n);
++    switch (g->type) {
++        case GGML_TYPE_F32:
++            memcpy(out.data(), g->data, n * sizeof(float));
++            break;
++        case GGML_TYPE_F16: {
++            const ggml_fp16_t * p = (const ggml_fp16_t *) g->data;
++            for (int64_t i = 0; i < n; ++i) out[i] = ggml_fp16_to_fp32(p[i]);
++        } break;
++        case GGML_TYPE_BF16: {
++            const uint16_t * p = (const uint16_t *) g->data;
++            for (int64_t i = 0; i < n; ++i) {
++                uint32_t u = (uint32_t) p[i] << 16;
++                float f;
++                memcpy(&f, &u, 4);
++                out[i] = f;
++            }
++        } break;
++        case GGML_TYPE_Q8_0:
++            dequantize_row_q8_0((const block_q8_0 *) g->data, out.data(), n);
++            break;
++        case GGML_TYPE_Q4_0:
++            dequantize_row_q4_0((const block_q4_0 *) g->data, out.data(), n);
++            break;
++        default:
++            GGML_ABORT("qgate: unsupported gate tensor type %d", g->type);
++    }
++}
++
++static void qgate_compute(ggml_tensor * dst, const ggml_tensor * state, const ggml_tensor * gate, const ggml_tensor * meta, int ith, int nth, void * /*userdata*/) {
++
++    const int64_t d2 = state->ne[0];
++    const int64_t d  = d2 / 2;
++    const int64_t nt = state->ne[1] > 0 ? state->ne[1] : 1;
++
++    const int32_t * m  = (const int32_t *) meta->data;
++    const int k  = m[0];
++    const int nc = m[1];
++    const int32_t * targets  = m + 2;
++    const int32_t * controls = m + 2 + k;
++
++    const int gate_dim = (int) gate->ne[0];
++    const int g  = 1 << (k + 1);
++    const int kb = 1 << k;
++
++    std::vector<float> Gbuf;
++    qgate_dequant_gate(gate, Gbuf);
++    const float * G = Gbuf.data();
++    const float * src = (const float *) state->data;
++    float       * out = (float *)       dst->data;
++
++    int tmask = 0;
++    for (int j = 0; j < k; ++j) tmask |= 1 << targets[j];
++
++    std::vector<float> in_vec(g), out_vec(g);
++
++    for (int64_t t = 0; t < nt; ++t) {
++        const float * in = src + t * d2;
++        float       * o  = out + t * d2;
++
++        for (int64_t x = ith; x < d; x += nth) {
++            if ((x & tmask) != 0) continue; // handle each block once, at its base
++
++            bool active = true;
++            for (int c = 0; c < nc; ++c) {
++                if (((x >> controls[c]) & 1) == 0) { active = false; break; }
++            }
++
++            if (!active) {
++                for (int yt = 0; yt < kb; ++yt) {
++                    int64_t y = x;
++                    for (int j = 0; j < k; ++j) if ((yt >> j) & 1) y |= (int64_t) 1 << targets[j];
++                    o[y]     = in[y];
++                    o[d + y] = in[d + y];
++                }
++                continue;
++            }
++
++            for (int yt = 0; yt < kb; ++yt) {
++                int64_t y = x;
++                for (int j = 0; j < k; ++j) if ((yt >> j) & 1) y |= (int64_t) 1 << targets[j];
++                in_vec[yt]      = in[y];
++                in_vec[kb + yt] = in[d + y];
++            }
++            for (int oo = 0; oo < g; ++oo) {
++                const float * row = G + (int64_t) oo * gate_dim;
++                float acc = 0.0f;
++                for (int i = 0; i < g; ++i) acc += row[i] * in_vec[i];
++                out_vec[oo] = acc;
++            }
++            for (int yt = 0; yt < kb; ++yt) {
++                int64_t y = x;
++                for (int j = 0; j < k; ++j) if ((yt >> j) & 1) y |= (int64_t) 1 << targets[j];
++                o[y]     = out_vec[yt];
++                o[d + y] = out_vec[kb + yt];
++            }
++        }
++    }
++}
++
++void llama_model_qgate::load_arch_hparams(llama_model_loader & ml) {
++    // generic arch keys (qgate.context_length / embedding_length / block_count)
++    // are loaded by llama_model::load_hparams; we only add our own sizes here
++    ml.get_key("qgate.gate_dim", gate_dim);
++    ml.get_key("qgate.meta_dim", meta_dim);
++}
++
++void llama_model_qgate::load_arch_tensors(llama_model_loader &) {
++    LLAMA_LOAD_LOCALS;
++
++    tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,    "weight"), {n_embd, n_vocab}, 0);
++    output_norm = create_tensor(tn(LLM_TENSOR_OUTPUT_NORM,  "weight"), {n_embd}, 0);
++    // tie the lm head to the token embedding (vocab is tiny; logits are unused)
++    output      = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,    "weight"), {n_embd, n_vocab}, TENSOR_DUPLICATED);
++
++    qgate.resize(n_layer);
++    qgate_meta.resize(n_layer);
++    for (int i = 0; i < n_layer; ++i) {
++        qgate[i]      = create_tensor(tn(LLM_TENSOR_QGATE,      "weight", i), {gate_dim, gate_dim}, 0);
++        qgate_meta[i] = create_tensor(tn(LLM_TENSOR_QGATE_META, i),           {meta_dim}, 0);
++    }
++}
++
++std::unique_ptr<llm_graph_context> llama_model_qgate::build_arch_graph(const llm_graph_params & params) const {
++    return std::make_unique<graph>(*this, params);
++}
++
++llama_model_qgate::graph::graph(const llama_model & model, const llm_graph_params & params) : llm_graph_context(params) {
++    const auto & m = static_cast<const llama_model_qgate &>(model);
++
++    ggml_tensor * cur = build_inp_embd(model.tok_embd);
++
++    for (int il = 0; il < n_layer; ++il) {
++        // inplace is safe: the kernel gathers each block into a local buffer
++        // before scattering it back, and blocks are disjoint
++        cur = ggml_map_custom3_inplace(ctx0, cur, m.qgate[il], m.qgate_meta[il], qgate_compute, GGML_N_TASKS_MAX, nullptr);
++        cb(cur, "qgate_out", il);
++    }
++
++    cur = build_norm(cur, model.output_norm, nullptr, LLM_NORM_RMS, -1);
++    cb(cur, "result_norm", -1);
++    res->t_embd = cur;
++
++    cur = build_lora_mm(model.output, cur);
++    cb(cur, "result_output", -1);
++    res->t_logits = cur;
++}

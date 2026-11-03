@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "qullama"
+version = "0.1.0"
+description = "Run OpenQASM quantum circuits inside patched llama.cpp via qgate GGUF models"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "numpy>=1.24",
+    "gguf>=0.10",           # official gguf-py (GGUFWriter/GGUFReader), from PyPI
+    # qiskit core only (QuantumCircuit, qasm2/qasm3, transpile, Statevector);
+    # the Aer simulator is a separate package and not needed here.
+    # qiskit-qasm3-import is the small companion package for OpenQASM 3 input.
+    "qiskit>=2.0",
+    "qiskit-qasm3-import>=0.5",
+]
+
+[project.optional-dependencies]
+# tests read GGUFs back via gguf-py, which imports yaml
+test = ["pyyaml"]
+
+[project.scripts]
+qullama = "qullama.cli:main"
+
+[tool.setuptools]
+packages = ["qullama"]
