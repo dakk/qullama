@@ -1,14 +1,18 @@
-# qullama - run quantum circuits inside llama.cpp
+# qullama
 
 [![CI](https://github.com/dakk/qullama/actions/workflows/ci.yml/badge.svg)](https://github.com/dakk/qullama/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue.svg)](https://www.python.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
 `qullama` turns a quantum circuit into a `qgate` GGUF "model" whose layers are
-the gates themselves; running it with `llama-embedding` on a one-token prompt
-applies the circuit to |0…0⟩ and returns the output statevector. llama.cpp is
-used with a small patch (a custom arch built on the stock `ggml_map_custom3` op
-- no ggml core changes).
+the gates themselves; running it with `llama-embedding` applies the circuit to |0...0>
+and returns the output statevector. llama.cpp is used with a small patch (a custom arch 
+built on the stock `ggml_map_custom3` op).
+
+The quantum circuit can be run on a quantized version, reducing the memory footprint. This implementation also contains cuda and vulkan kernels.
+
+This is a proof of concepts, it needs further adjustment and development in order to make it usable and useful. Feel free to submit PR.
+
 
 
 ## Quick start
@@ -33,7 +37,7 @@ error against qiskit's `Statevector` (the only crosscheck).
 
 ## Library usage
 
-Build the circuit directly in Python and use qullama as the simulator backend
+Build the circuit directly in Python / Qiskit and use qullama as the simulator backend
 (see `examples/library_demo.py`):
 
 ```python
