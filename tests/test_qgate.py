@@ -158,7 +158,7 @@ def test_library_backend():
 def test_quantization_dtypes():
     """Gate-weight quantization: F32 exact, Q8_0/Q4_0/F16 close, via the real binary."""
     if not (ROOT / "llama.cpp" / "build" / "bin" / "llama-embedding").exists():
-        print("skip: patched binary not built — quantization test skipped")
+        print("skip: patched binary not built - quantization test skipped")
         return
     qc = load_circuit_file(ROOT / "examples" / "qft3.qasm")
     ref = statevector_reference(qc)

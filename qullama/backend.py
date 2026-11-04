@@ -48,8 +48,11 @@ def parse_embedding_output(text: str) -> np.ndarray:
 
 
 def run_gguf(gguf: str | Path, *, llama_embedding: str | Path | None = None,
-             prompt_token: str = "q") -> np.ndarray:
-    """Run a qgate GGUF in the patched llama.cpp; return the raw embedding vector."""
+             prompt_token: str = "q", ctx: int = 8) -> np.ndarray:
+    """Run a qgate GGUF in the patched llama.cpp; return the raw embedding vector.
+
+    ctx: -c value. Keep small: ggml reserves ~5 x n_ctx x n_embd compute buffers
+    (40 GB at 27 qubits with -c 8), so large n_embd needs a small ctx."""
     binary = Path(llama_embedding) if llama_embedding else DEFAULT_BINARY
     if not binary.exists():
         raise FileNotFoundError(
@@ -60,9 +63,9 @@ def run_gguf(gguf: str | Path, *, llama_embedding: str | Path | None = None,
          "-n", "1", "--no-warmup", "--embd-output-format", "raw",
          # -np 2: the embedding example bumps n_parallel==1 up to llama_max_parallel_sequences(),
          # which would reserve an n_embd x n_parallel output buffer (2 GB+ at 20 qubits);
-         # -np 2 stays small. -c 8 keeps the context small — context compute buffers scale
+         # -np 2 stays small. -c 8 keeps the context small - context compute buffers scale
          # with n_embd x n_ctx (40 GB at 24 qubits with -c 64).
-         "-np", "2", "-c", "8"],
+         "-np", "2", "-c", str(ctx)],
         capture_output=True, text=True,
     )
     return parse_embedding_output(proc.stdout + proc.stderr)

@@ -48,9 +48,14 @@ fi
 
 # 3. configure + build the tools we need
 echo "==> configuring cmake build in $BUILD_DIR"
+# set VULKAN=1 to also build the Vulkan backend (needs glslc + Vulkan SDK headers),
+# CUDA=1 for the CUDA backend (needs nvcc)
+EXTRA_CMAKE=()
+[ "${VULKAN:-0}" = "1" ] && EXTRA_CMAKE+=(-DGGML_VULKAN=ON -DCMAKE_PREFIX_PATH=/usr/share/cmake/SPIRV-Headers)
+[ "${CUDA:-0}" = "1" ] && EXTRA_CMAKE+=(-DGGML_CUDA=ON)
 cmake -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release \
     -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=ON \
-    -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TOOLS=ON -DGGML_NATIVE=ON
+    -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TOOLS=ON -DGGML_NATIVE=ON "${EXTRA_CMAKE[@]}"
 
 echo "==> building llama-embedding + llama-tokenize with -j$JOBS"
 cmake --build "$BUILD_DIR" --target llama-embedding llama-tokenize -j "$JOBS"

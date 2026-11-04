@@ -4,7 +4,7 @@ Statevector simulator, on increasingly large random circuits.
 
 For each n_qubits we build the same random circuit twice:
   * qiskit:  peak Python allocation (tracemalloc) around Statevector(qc)
-             — theory: 16 * 2**n bytes for the complex128 statevector
+             - theory: 16 * 2**n bytes for the complex128 statevector
   * qullama: GGUF file size + max RSS of the llama-embedding child process
              (measured in a fresh wrapper subprocess via resource.RUSAGE_CHILDREN)
 and check both agree with each other.
@@ -55,8 +55,8 @@ def worker(n: int, gpq: int, seed: int) -> None:
     """Run one measurement in this fresh process; print JSON to stdout.
 
     Reports both backends from the same process:
-      qiskit_self_maxrss_kb  — RUSAGE_SELF peak after Statevector(qc) (incl. interpreter baseline)
-      child_maxrss_kb        — RUSAGE_CHILDREN peak of the llama-embedding run
+      qiskit_self_maxrss_kb  - RUSAGE_SELF peak after Statevector(qc) (incl. interpreter baseline)
+      child_maxrss_kb        - RUSAGE_CHILDREN peak of the llama-embedding run
     """
     from qiskit.quantum_info import Statevector
 

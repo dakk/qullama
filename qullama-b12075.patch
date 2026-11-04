@@ -1,5 +1,614 @@
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 3ed4181..32f7139 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -606,6 +606,8 @@ extern "C" {
+ 
+         GGML_OP_GLU,
+ 
++        GGML_OP_QGATE,
++
+         GGML_OP_COUNT,
+     };
+ 
+@@ -2835,6 +2837,17 @@ extern "C" {
+             int                     n_tasks,
+             void                  * userdata);
+ 
++    // qullama: apply a quantum gate to a state vector.
++    //   a    : state, F32, ne = [2d, n_tokens]; per column [Re(d); Im(d)]
++    //   gate : F32 (or block-quantized on CPU), ne = [gate_dim, gate_dim],
++    //          top-left 2^(k+1) x 2^(k+1) block = real form of the complex gate
++    //   meta : I32, [k, n_controls, targets..., controls...]
++    GGML_API struct ggml_tensor * ggml_qgate(
++            struct ggml_context   * ctx,
++            struct ggml_tensor    * a,
++            struct ggml_tensor    * gate,
++            struct ggml_tensor    * meta);
++
+     GGML_API struct ggml_tensor * ggml_map_custom3_inplace(
+             struct ggml_context   * ctx,
+             struct ggml_tensor    * a,
+diff --git a/ggml/src/ggml-backend-meta.cpp b/ggml/src/ggml-backend-meta.cpp
+index c30bdae..e6898cb 100644
+--- a/ggml/src/ggml-backend-meta.cpp
++++ b/ggml/src/ggml-backend-meta.cpp
+@@ -1076,7 +1076,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
+             case GGML_OP_MAP_CUSTOM1:
+             case GGML_OP_MAP_CUSTOM2:
+             case GGML_OP_MAP_CUSTOM3:
+-            case GGML_OP_CUSTOM: {
++            case GGML_OP_CUSTOM:
++            case GGML_OP_QGATE: {
+                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
+             } break;
+             case GGML_OP_CROSS_ENTROPY_LOSS:
+diff --git a/ggml/src/ggml-cpu/ggml-cpu.c b/ggml/src/ggml-cpu/ggml-cpu.c
+index f4eaea5..6a72c8e 100644
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -2138,6 +2138,11 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
+                 ggml_compute_forward_map_custom3(params, tensor);
+             }
+             break;
++        case GGML_OP_QGATE:
++            {
++                ggml_compute_forward_qgate(params, tensor);
++            }
++            break;
+         case GGML_OP_CUSTOM:
+             {
+                 ggml_compute_forward_custom(params, tensor);
+@@ -2495,6 +2500,9 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
+                     n_tasks = MIN(p.n_tasks, n_threads);
+                 }
+             } break;
++        case GGML_OP_QGATE:
++            n_tasks = n_threads;
++            break;
+         case GGML_OP_CUSTOM:
+             {
+                 struct ggml_custom_op_params p;
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index dbdde69..8bdca08 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -8,6 +8,10 @@
+ #include "unary-ops.h"
+ #include "vec.h"
+ 
++#include <vector>
++
++#include "../ggml-quants.h" // dequantize_row_q8_0/q4_0, block_q8_0/q4_0
++
+ #include <algorithm>
+ #include <cfloat>
+ #include <cmath>
+@@ -11989,6 +11993,125 @@ void ggml_compute_forward_map_custom2(
+     p.fun(dst, a, b, params->ith, params->nth, p.userdata);
+ }
+ 
++// ggml_compute_forward_qgate (qullama)
++
++// dequantize a gate weight tensor into a row-major F32 buffer
++static void qgate_dequant_gate(const ggml_tensor * g, std::vector<float> & out) {
++    const int64_t n = g->ne[0] * g->ne[1];
++    out.resize(n);
++    switch (g->type) {
++        case GGML_TYPE_F32:
++            memcpy(out.data(), g->data, n * sizeof(float));
++            break;
++        case GGML_TYPE_F16: {
++            const ggml_fp16_t * p = (const ggml_fp16_t *) g->data;
++            for (int64_t i = 0; i < n; ++i) out[i] = ggml_fp16_to_fp32(p[i]);
++        } break;
++        case GGML_TYPE_BF16: {
++            const uint16_t * p = (const uint16_t *) g->data;
++            for (int64_t i = 0; i < n; ++i) {
++                uint32_t u = (uint32_t) p[i] << 16;
++                float f;
++                memcpy(&f, &u, 4);
++                out[i] = f;
++            }
++        } break;
++        case GGML_TYPE_Q8_0:
++            dequantize_row_q8_0((const block_q8_0 *) g->data, out.data(), n);
++            break;
++        case GGML_TYPE_Q4_0:
++            dequantize_row_q4_0((const block_q4_0 *) g->data, out.data(), n);
++            break;
++        default:
++            GGML_ABORT("qgate: unsupported gate tensor type %d", g->type);
++    }
++}
++
++static void qgate_compute_thread(ggml_tensor * dst, const ggml_tensor * state, const ggml_tensor * gate,
++                                 const ggml_tensor * meta, const float * G, int ith, int nth) {
++    const int64_t d2 = state->ne[0];
++    const int64_t d  = d2 / 2;
++    const int64_t nt = state->ne[1] > 0 ? state->ne[1] : 1;
++
++    const int32_t * m  = (const int32_t *) meta->data;
++    const int k  = m[0];
++    const int nc = m[1];
++    const int32_t * targets  = m + 2;
++    const int32_t * controls = m + 2 + k;
++
++    const int gate_dim = (int) gate->ne[0];
++    const int g  = 1 << (k + 1);
++    const int kb = 1 << k;
++
++    const float * src = (const float *) state->data;
++    float       * out = (float *)       dst->data;
++
++    int tmask = 0;
++    for (int j = 0; j < k; ++j) tmask |= 1 << targets[j];
++
++    std::vector<float> in_vec(g), out_vec(g);
++
++    for (int64_t t = 0; t < nt; ++t) {
++        const float * in = src + t * d2;
++        float       * o  = out + t * d2;
++
++        for (int64_t x = ith; x < d; x += nth) {
++            if ((x & tmask) != 0) continue; // handle each block once, at its base
++
++            bool active = true;
++            for (int c = 0; c < nc; ++c) {
++                if (((x >> controls[c]) & 1) == 0) { active = false; break; }
++            }
++            if (!active) {
++                for (int yt = 0; yt < kb; ++yt) {
++                    int64_t y = x;
++                    for (int j = 0; j < k; ++j) if ((yt >> j) & 1) y |= (int64_t) 1 << targets[j];
++                    o[y]     = in[y];
++                    o[d + y] = in[d + y];
++                }
++                continue;
++            }
++            for (int yt = 0; yt < kb; ++yt) {
++                int64_t y = x;
++                for (int j = 0; j < k; ++j) if ((yt >> j) & 1) y |= (int64_t) 1 << targets[j];
++                in_vec[yt]      = in[y];
++                in_vec[kb + yt] = in[d + y];
++            }
++            for (int oo = 0; oo < g; ++oo) {
++                const float * row = G + (int64_t) oo * gate_dim;
++                float acc = 0.0f;
++                for (int i = 0; i < g; ++i) acc += row[i] * in_vec[i];
++                out_vec[oo] = acc;
++            }
++            for (int yt = 0; yt < kb; ++yt) {
++                int64_t y = x;
++                for (int j = 0; j < k; ++j) if ((yt >> j) & 1) y |= (int64_t) 1 << targets[j];
++                o[y]     = out_vec[yt];
++                o[d + y] = out_vec[kb + yt];
++            }
++        }
++    }
++}
++
++void ggml_compute_forward_qgate(
++        const ggml_compute_params * params,
++              ggml_tensor * dst) {
++    const ggml_tensor * state = dst->src[0];
++    const ggml_tensor * gate  = dst->src[1];
++    const ggml_tensor * meta  = dst->src[2];
++    fprintf(stderr, "[qgate fwd] ith=%d nth=%d state ne=%lld,%lld gate ne=%lld,%lld type=%d meta ne=%lld type=%d\n",
++            params->ith, params->nth, (long long) state->ne[0], (long long) state->ne[1],
++            (long long) gate->ne[0], (long long) gate->ne[1], gate->type, (long long) meta->ne[0], meta->type);
++
++    std::vector<float> Gbuf;
++    qgate_dequant_gate(gate, Gbuf);
++    const float * G = Gbuf.data();
++
++    // the graph-level compute already splits nodes across threads; each thread
++    // handles its strided share of block bases via (ith, nth)
++    qgate_compute_thread(dst, state, gate, meta, G, params->ith, params->nth);
++}
++
+ // ggml_compute_forward_map_custom3
+ 
+ void ggml_compute_forward_map_custom3(
+diff --git a/ggml/src/ggml-cpu/ops.h b/ggml/src/ggml-cpu/ops.h
+index 00a2ea7..f6437de 100644
+--- a/ggml/src/ggml-cpu/ops.h
++++ b/ggml/src/ggml-cpu/ops.h
+@@ -112,6 +112,7 @@ void ggml_compute_forward_top_k_mask(const struct ggml_compute_params * params,
+ void ggml_compute_forward_map_custom1(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom2(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_map_custom3(const struct ggml_compute_params * params, struct ggml_tensor * dst);
++void ggml_compute_forward_qgate(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_custom(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_cross_entropy_loss(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+ void ggml_compute_forward_cross_entropy_loss_back(const struct ggml_compute_params * params, struct ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 06956ce..0c921f7 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -9,6 +9,7 @@
+ #include "ggml-cuda/arange.cuh"
+ #include "ggml-cuda/argmax.cuh"
+ #include "ggml-cuda/argsort.cuh"
++#include "ggml-cuda/qgate.cuh"
+ #include "ggml-cuda/binbcast.cuh"
+ #include "ggml-cuda/clamp.cuh"
+ #include "ggml-cuda/col2im-1d.cuh"
+@@ -2641,6 +2642,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
+         case GGML_OP_CUMSUM:
+             ggml_cuda_op_cumsum(ctx, dst);
+             break;
++        case GGML_OP_QGATE:
++            ggml_cuda_op_qgate(ctx, dst);
++            break;
+         case GGML_OP_SUM_ROWS:
+             ggml_cuda_op_sum_rows(ctx, dst);
+             break;
+@@ -6208,6 +6212,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
+         case GGML_OP_DIAG:
+         case GGML_OP_SOLVE_TRI:
+             return true;
++        case GGML_OP_QGATE:
++            // F32 gates only; quantized gate weights fall back to the CPU op
++            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
++                   op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32;
+         case GGML_OP_LIGHTNING_INDEXER:
+             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+         case GGML_OP_TOP_K_MASK:
+diff --git a/ggml/src/ggml-cuda/qgate.cu b/ggml/src/ggml-cuda/qgate.cu
+new file mode 100644
+index 0000000..2c9c1e5
+--- /dev/null
++++ b/ggml/src/ggml-cuda/qgate.cu
+@@ -0,0 +1,91 @@
++// qullama: QGATE op, CUDA kernel. One thread per block base (basis index whose
++// target bits are all zero); the thread gathers the block, multiplies by the
++// gate's real block matrix, and scatters back. Control-off blocks are copied.
++// State layout per token column: [Re(d); Im(d)], d = 2^n; qubit i = bit i.
++
++#include "qgate.cuh"
++
++#define QGATE_MAX_G 64 // supports gates up to k=5 qubits (2^(k+1) <= 64)
++
++__global__ void qgate_kernel(const float * __restrict__ state,
++                             const float * __restrict__ gate,
++                             const int   * __restrict__ meta,
++                             float       * __restrict__ dst,
++                             int64_t d, int gate_dim, int64_t nt) {
++    const int64_t x = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
++    if (x >= d) return;
++
++    const int k  = meta[0];
++    const int nc = meta[1];
++    const int * targets  = meta + 2;
++    const int * controls = meta + 2 + k;
++
++    const int g  = 1 << (k + 1);
++    const int kb = 1 << k;
++    GGML_ASSERT(g <= QGATE_MAX_G);
++
++    int tmask = 0;
++    for (int j = 0; j < k; ++j) tmask |= 1 << targets[j];
++    if (x & tmask) return; // handle each block once, at its base
++
++    bool active = true;
++    for (int c = 0; c < nc; ++c) {
++        if (((x >> controls[c]) & 1) == 0) { active = false; break; }
++    }
++
++    for (int64_t t = 0; t < nt; ++t) {
++        const float * in  = state + t * 2 * d;
++        float       * out = dst   + t * 2 * d;
++
++        if (!active) {
++            for (int yt = 0; yt < kb; ++yt) {
++                int64_t y = x;
++                for (int j = 0; j < k; ++j) if ((yt >> j) & 1) y |= (int64_t) 1 << targets[j];
++                out[y]     = in[y];
++                out[d + y] = in[d + y];
++            }
++            continue;
++        }
++
++        float in_vec[QGATE_MAX_G];
++        for (int yt = 0; yt < kb; ++yt) {
++            int64_t y = x;
++            for (int j = 0; j < k; ++j) if ((yt >> j) & 1) y |= (int64_t) 1 << targets[j];
++            in_vec[yt]      = in[y];
++            in_vec[kb + yt] = in[d + y];
++        }
++        float out_vec[QGATE_MAX_G];
++        for (int oo = 0; oo < g; ++oo) {
++            const float * row = gate + (int64_t) oo * gate_dim;
++            float acc = 0.0f;
++            for (int i = 0; i < g; ++i) acc += row[i] * in_vec[i];
++            out_vec[oo] = acc;
++        }
++        for (int yt = 0; yt < kb; ++yt) {
++            int64_t y = x;
++            for (int j = 0; j < k; ++j) if ((yt >> j) & 1) y |= (int64_t) 1 << targets[j];
++            out[y]     = out_vec[yt];
++            out[d + y] = out_vec[kb + yt];
++        }
++    }
++}
++
++void ggml_cuda_op_qgate(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
++    const ggml_tensor * state = dst->src[0];
++    const ggml_tensor * gate  = dst->src[1];
++    const ggml_tensor * meta  = dst->src[2];
++
++    GGML_ASSERT(state->type == GGML_TYPE_F32);
++    GGML_ASSERT(gate->type == GGML_TYPE_F32); // quantized gates are handled on CPU
++    GGML_ASSERT(meta->type == GGML_TYPE_I32);
++
++    const int64_t d  = state->ne[0] / 2;
++    const int64_t nt = state->ne[1] > 0 ? state->ne[1] : 1;
++    const int gate_dim = (int) gate->ne[0];
++
++    const int threads = 256;
++    const int64_t blocks = (d + threads - 1) / threads;
++    qgate_kernel<<<blocks, threads, 0, ctx.stream>>>(
++        (const float *) state->data, (const float *) gate->data, (const int *) meta->data,
++        (float *) dst->data, d, gate_dim, nt);
++}
+diff --git a/ggml/src/ggml-cuda/qgate.cuh b/ggml/src/ggml-cuda/qgate.cuh
+new file mode 100644
+index 0000000..dce47bd
+--- /dev/null
++++ b/ggml/src/ggml-cuda/qgate.cuh
+@@ -0,0 +1,5 @@
++#include "common.cuh"
++
++// qullama: apply a quantum gate to a state vector on CUDA.
++// Only F32 gate weights are supported on GPU; quantized gates fall back to CPU.
++void ggml_cuda_op_qgate(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+index 219c477..70c5080 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-push-constants.h
+@@ -826,6 +826,13 @@ struct vk_op_upscale_push_constants {
+     float pixel_offset;
+ };
+ 
++struct vk_op_qgate_push_constants
++{
++    uint32_t d;         // state dimension (2^n), half of ne0
++    uint32_t gate_dim;  // row stride of the gate matrix
++    uint32_t nt;        // number of token columns
++};
++
+ struct vk_op_sum_rows_push_constants
+ {
+     uint32_t n_cols;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan-types.h b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+index d3b1a8d..cd23ec7 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan-types.h
++++ b/ggml/src/ggml-vulkan/ggml-vulkan-types.h
+@@ -936,6 +936,7 @@ struct vk_device_struct {
+     vk_pipeline pipeline_cross_entropy_loss_f32, pipeline_cross_entropy_loss_f32_wg512;
+     vk_pipeline pipeline_cross_entropy_loss_back_f32, pipeline_cross_entropy_loss_back_f32_wg512;
+     vk_pipeline pipeline_fwht_f32[4];
++    vk_pipeline pipeline_qgate_f32;
+     vk_pipeline pipeline_cumsum_f32;
+     vk_pipeline pipeline_cumsum_small_f32;
+     vk_pipeline pipeline_cumsum_multipass1_f32;
+diff --git a/ggml/src/ggml-vulkan/ggml-vulkan.cpp b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+index 89f0470..6cd468b 100644
+--- a/ggml/src/ggml-vulkan/ggml-vulkan.cpp
++++ b/ggml/src/ggml-vulkan/ggml-vulkan.cpp
+@@ -3599,6 +3599,7 @@ void ggml_vk_load_shaders(vk_device& device, vk_pipeline requested) {
+     }
+ 
+     const uint32_t cumsum_elem_per_thread = (device->vendor_id == VK_VENDOR_ID_AMD || device->vendor_id == VK_VENDOR_ID_INTEL) ? 2 : 4;
++    ggml_vk_create_pipeline(device, device->pipeline_qgate_f32,         "qgate_f32", qgate_f32_len, qgate_f32_data, "main", 4, sizeof(vk_op_qgate_push_constants), {1, 1, 1}, {256, 1, 1}, 1, false, false, 0);
+     ggml_vk_create_pipeline(device, device->pipeline_cumsum_f32,       "cumsum_f32", cumsum_f32_len, cumsum_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { 256, device->subgroup_size, cumsum_elem_per_thread }, 1, true, true, device->subgroup_size);
+     ggml_vk_create_pipeline(device, device->pipeline_cumsum_small_f32, "cumsum_f32", cumsum_f32_len, cumsum_f32_data, "main", 2, sizeof(vk_op_sum_rows_push_constants), {1, 1, 1}, { 128, device->subgroup_size, 1 }, 1, true, true, device->subgroup_size);
+     ggml_vk_create_pipeline(device, device->pipeline_cumsum_multipass1_f32, "cumsum_multipass1_f32", cumsum_multipass1_f32_len, cumsum_multipass1_f32_data, "main", 3, sizeof(vk_op_sum_rows_push_constants), {256, 1, 1}, { 256, device->subgroup_size }, 1, true, true, device->subgroup_size);
+@@ -11703,6 +11704,29 @@ void ggml_vk_mean(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_
+     ggml_vk_op_f32(ctx, subctx, src0, nullptr, nullptr, nullptr, dst, GGML_OP_MEAN, p);
+ }
+ 
++void ggml_vk_qgate(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * src2, ggml_tensor * dst) {
++    // qullama: src0 = state (F32), src1 = gate matrix (F32), src2 = meta (I32)
++    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && src2->type == GGML_TYPE_I32);
++    GGML_ASSERT(src1->ne[0] <= 64); // shader's fixed-size gate buffer
++
++    vk_pipeline pipeline = ctx->device->pipeline_qgate_f32;
++    GGML_ASSERT(pipeline != nullptr);
++
++    ggml_pipeline_request_descriptor_sets(ctx, pipeline, 1);
++
++    vk_op_qgate_push_constants pc = {};
++    pc.d = (uint32_t) (src0->ne[0] / 2);
++    pc.gate_dim = (uint32_t) src1->ne[0];
++    pc.nt = (uint32_t) (src0->ne[1] > 0 ? src0->ne[1] : 1);
++
++    vk_subbuffer state_buf = ggml_vk_tensor_subbuffer(ctx, src0);
++    vk_subbuffer gate_buf  = ggml_vk_tensor_subbuffer(ctx, src1);
++    vk_subbuffer meta_buf  = ggml_vk_tensor_subbuffer(ctx, src2);
++    vk_subbuffer dst_buf   = ggml_vk_tensor_subbuffer(ctx, dst);
++
++    ggml_vk_dispatch_pipeline(ctx, subctx, pipeline, { state_buf, gate_buf, meta_buf, dst_buf }, pc, { pc.d, 1, 1 });
++}
++
+ void ggml_vk_cumsum(ggml_backend_vk_context * ctx, vk_context& subctx, const ggml_tensor * src0, ggml_tensor * dst) {
+     vk_op_sum_rows_push_constants pc = vk_op_sum_rows_push_constants_init(src0, dst, src0->ne[0]);
+     // Use the single pass shader when the rows are small or there are enough rows to fill the GPU.
+@@ -12789,6 +12813,10 @@ bool ggml_vk_build_graph(ggml_backend_vk_context * ctx, ggml_cgraph * cgraph, in
+     case GGML_OP_CUMSUM:
+         ggml_vk_cumsum(ctx, compute_ctx, src0, node);
+ 
++        break;
++    case GGML_OP_QGATE:
++        ggml_vk_qgate(ctx, compute_ctx, src0, src1, src2, node);
++
+         break;
+     case GGML_OP_DSV4_HC_COMB:
+         ggml_vk_dsv4_hc_comb(ctx, compute_ctx, src0, src1, src2, node);
+@@ -15987,6 +16015,10 @@ static bool ggml_backend_vk_device_supports_op(ggml_backend_dev_t dev, const ggm
+                 }
+                 return false;
+             }
++        case GGML_OP_QGATE:
++            // F32 gates only; quantized gate weights fall back to the CPU op
++            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 &&
++                   op->src[1]->type == GGML_TYPE_F32 && op->src[2]->type == GGML_TYPE_I32;
+         case GGML_OP_DSV4_HC_COMB:
+         case GGML_OP_DSV4_HC_PRE:
+         case GGML_OP_DSV4_HC_POST:
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/qgate.comp b/ggml/src/ggml-vulkan/vulkan-shaders/qgate.comp
+new file mode 100644
+index 0000000..ed7948e
+--- /dev/null
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/qgate.comp
+@@ -0,0 +1,76 @@
++#version 450
++
++// qullama QGATE: apply one quantum gate to the state vector.
++// One thread per block base (basis index whose target bits are all zero).
++// State per token column: [Re(d); Im(d)], d = 2^n, qubit i = bit i.
++// gate: row-major real block matrix of the complex gate, stride gate_dim.
++// meta: [k, n_controls, targets..., controls...]
++
++layout(local_size_x = 256, local_size_y = 1, local_size_z = 1) in;
++
++layout(binding = 0) readonly buffer A { float state[]; };
++layout(binding = 1) readonly buffer B { float gate[]; };
++layout(binding = 2) readonly buffer C { int meta[]; };
++layout(binding = 3) writeonly buffer D { float dst[]; };
++
++layout(push_constant) uniform PushConstants {
++    uint d;
++    uint gate_dim;
++    uint nt;
++} pc;
++
++void main() {
++    uint x = gl_GlobalInvocationID.x;
++    if (x >= pc.d) return;
++
++    int k = meta[0];
++    int nc = meta[1];
++
++    uint tmask = 0u;
++    for (int j = 0; j < k; ++j) tmask |= 1u << uint(meta[2 + j]);
++    if ((x & tmask) != 0u) return; // handle each block once, at its base
++
++    bool is_active = true;
++    for (int c = 0; c < nc; ++c) {
++        if (((x >> uint(meta[2 + k + c])) & 1u) == 0u) { is_active = false; break; }
++    }
++
++    int kb = 1 << k;
++    int g = 1 << (k + 1);
++
++    for (uint t = 0u; t < pc.nt; ++t) {
++        uint base = t * 2u * pc.d;
++
++        if (!is_active) {
++            for (int yt = 0; yt < kb; ++yt) {
++                uint y = x;
++                for (int j = 0; j < k; ++j) if (((yt >> j) & 1) != 0) y |= 1u << uint(meta[2 + j]);
++                dst[base + y] = state[base + y];
++                dst[base + pc.d + y] = state[base + pc.d + y];
++            }
++            continue;
++        }
++
++        float in_vec[64];
++        for (int yt = 0; yt < kb; ++yt) {
++            uint y = x;
++            for (int j = 0; j < k; ++j) if (((yt >> j) & 1) != 0) y |= 1u << uint(meta[2 + j]);
++            in_vec[yt] = state[base + y];
++            in_vec[kb + yt] = state[base + pc.d + y];
++        }
++        float out_vec[64];
++        for (int oo = 0; oo < g; ++oo) {
++            float acc = 0.0;
++            for (int i = 0; i < g; ++i) {
++                acc += gate[uint(oo) * pc.gate_dim + uint(i)] * in_vec[i];
++            }
++            out_vec[oo] = acc;
++        }
++        for (int yt = 0; yt < kb; ++yt) {
++            uint y = x;
++            for (int j = 0; j < k; ++j) if (((yt >> j) & 1) != 0) y |= 1u << uint(meta[2 + j]);
++            dst[base + y] = out_vec[yt];
++            dst[base + pc.d + y] = out_vec[kb + yt];
++        }
++    }
++}
+diff --git a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+index 3af09fb..cd4af57 100644
+--- a/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
++++ b/ggml/src/ggml-vulkan/vulkan-shaders/vulkan-shaders-gen.cpp
+@@ -1116,6 +1116,7 @@ void process_shaders() {
+     string_to_spv("dsv4_hc_comb_f32", "dsv4_hc_comb.comp", {});
+     string_to_spv("dsv4_hc_pre_f32",  "dsv4_hc_pre.comp",  {});
+     string_to_spv("dsv4_hc_post_f32", "dsv4_hc_post.comp", {});
++    string_to_spv("qgate_f32", "qgate.comp", {});
+     string_to_spv("cumsum_f32", "cumsum.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+     string_to_spv("cumsum_multipass1_f32", "cumsum_multipass1.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+     string_to_spv("cumsum_multipass2_f32", "cumsum_multipass2.comp", merge_maps(base_dict, {{"A_TYPE", "float"}, {"D_TYPE", "float"}}));
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 3d60c44..4cf6339 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -1117,9 +1117,10 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
+     "OPT_STEP_SGD",
+ 
+     "GLU",
++    "QGATE",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 102");
+ 
+ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "none",
+@@ -1233,9 +1234,10 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
+     "sgd(x)",
+ 
+     "glu(x)",
++    "qgate(x,g,m)",
+ };
+ 
+-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
++static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT != 102");
+ 
+ static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
+ 
+@@ -6267,6 +6269,27 @@ struct ggml_tensor * ggml_map_custom3(
+     return ggml_map_custom3_impl(ctx, a, b, c, fun, n_tasks, userdata, false);
+ }
+ 
++// qullama: quantum gate application (see ggml.h for the tensor contract)
++struct ggml_tensor * ggml_qgate(
++        struct ggml_context * ctx,
++        struct ggml_tensor * a,
++        struct ggml_tensor * gate,
++        struct ggml_tensor * meta) {
++    GGML_ASSERT(a->type == GGML_TYPE_F32);
++    GGML_ASSERT(ggml_is_matrix(a));
++    GGML_ASSERT(ggml_is_quantized(gate->type) || gate->type == GGML_TYPE_F32 || gate->type == GGML_TYPE_F16 || gate->type == GGML_TYPE_BF16);
++    GGML_ASSERT(ggml_is_matrix(gate));
++    GGML_ASSERT(meta->type == GGML_TYPE_I32);
++    GGML_ASSERT(ggml_is_vector(meta));
++
++    struct ggml_tensor * result = ggml_dup_tensor(ctx, a);
++    result->op     = GGML_OP_QGATE;
++    result->src[0] = a;
++    result->src[1] = gate;
++    result->src[2] = meta;
++    return result;
++}
++
+ struct ggml_tensor * ggml_map_custom3_inplace(
+         struct ggml_context      * ctx,
+         struct ggml_tensor       * a,
 diff --git a/src/llama-arch.cpp b/src/llama-arch.cpp
-index 40f6083..8a1aa7c 100644
+index 40f6083..03bb4b7 100644
 --- a/src/llama-arch.cpp
 +++ b/src/llama-arch.cpp
 @@ -175,6 +175,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
@@ -23,8 +632,8 @@ index 40f6083..8a1aa7c 100644
  
      {LLM_TENSOR_ATTN_V_GATE,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
      {LLM_TENSOR_ATTN_V_EXPS,                {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT_ID}},
-+    {LLM_TENSOR_QGATE,                      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MAP_CUSTOM3}},
-+    {LLM_TENSOR_QGATE_META,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MAP_CUSTOM3}},
++    {LLM_TENSOR_QGATE,                      {LLM_TENSOR_LAYER_REPEATING, GGML_OP_QGATE}},
++    {LLM_TENSOR_QGATE_META,                 {LLM_TENSOR_LAYER_REPEATING, GGML_OP_QGATE}},
  };
  
  LLM_KV::LLM_KV(llm_arch arch, const char * suffix) : arch(arch), suffix(suffix) {}
@@ -50,18 +659,27 @@ index b98be40..cfb4a04 100644
  
  
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index 485483b..042e819 100644
+index 485483b..26eef70 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
-@@ -1062,6 +1062,12 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
+@@ -1062,6 +1062,21 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
              {
                  op_tensor = ggml_scale(ctx, w, 1.0f);
              } break;
-+        case GGML_OP_MAP_CUSTOM3:
++        case GGML_OP_QGATE:
 +            {
-+                ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, w->ne[0], 1);
-+                ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
-+                op_tensor = ggml_map_custom3(ctx, a, w, b, [](ggml_tensor *, const ggml_tensor *, const ggml_tensor *, const ggml_tensor *, int, int, void *) {}, GGML_N_TASKS_MAX, nullptr);
++                // the probe must reference w itself as a src, so that the
++                // extra-buffer (repack) delegation sees w->buffer below
++                ggml_tensor * a = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 8, 1);
++                if (w->type == GGML_TYPE_I32) {
++                    // w is the meta tensor: probe it in the meta slot
++                    ggml_tensor * g = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 4);
++                    op_tensor = ggml_qgate(ctx, a, g, w);
++                } else {
++                    // w is the gate matrix: probe it in the gate slot
++                    ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 4);
++                    op_tensor = ggml_qgate(ctx, a, w, b);
++                }
 +            } break;
          default:
              GGML_ABORT("%s: missing test for op %s for tensor %s", __func__, ggml_op_name(op), w->name);
@@ -116,139 +734,15 @@ index 1fc7cae..e1e32d6 100644
      void load_arch_hparams(llama_model_loader & ml) override;
 diff --git a/src/models/qgate.cpp b/src/models/qgate.cpp
 new file mode 100644
-index 0000000..83420c0
+index 0000000..67eaab4
 --- /dev/null
 +++ b/src/models/qgate.cpp
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,51 @@
 +#include "models.h"
 +
-+#include <vector>
-+
-+// ggml-quants.h is private to ggml; forward-declare the public dequant entry
-+// points (C linkage, symbols exported by ggml-base)
-+struct block_q8_0;
-+struct block_q4_0;
-+extern "C" {
-+    void dequantize_row_q8_0(const block_q8_0 * x, float * y, int64_t k);
-+    void dequantize_row_q4_0(const block_q4_0 * x, float * y, int64_t k);
-+}
-+
-+// ---------------------------------------------------------------------------
-+// qgate custom kernel (runs through ggml_map_custom3, no ggml changes needed)
-+//
-+// dst->src[0] = state : F32, ne = [2d, n_tokens]; per column: [Re(d); Im(d)]
-+// dst->src[1] = gate  : F32, ne = [gate_dim, gate_dim]; top-left g x g block (g = 2^(k+1))
-+//                     holds the real block matrix M = [[Ur, -Ui], [Ui, Ur]] of the
-+//                     complex 2^k x 2^k gate, row-major: M[o*gate_dim + i]
-+// dst->src[2] = meta  : I32, [k, n_controls, t0..t_{k-1}, c0..c_{m-1}]
-+//
-+// For each basis index x whose target bits are all 0 (block base), gather the
-+// block amplitudes, multiply by M, scatter back. Blocks whose control bits are
-+// not all 1 are copied unchanged. Qubit i = bit i of the basis index.
-+// ---------------------------------------------------------------------------
-+// dequantize a gate weight tensor (any supported type) into a row-major F32 buffer
-+static void qgate_dequant_gate(const ggml_tensor * g, std::vector<float> & out) {
-+    const int64_t ne0 = g->ne[0], ne1 = g->ne[1];
-+    const int64_t n = ne0 * ne1;
-+    out.resize(n);
-+    switch (g->type) {
-+        case GGML_TYPE_F32:
-+            memcpy(out.data(), g->data, n * sizeof(float));
-+            break;
-+        case GGML_TYPE_F16: {
-+            const ggml_fp16_t * p = (const ggml_fp16_t *) g->data;
-+            for (int64_t i = 0; i < n; ++i) out[i] = ggml_fp16_to_fp32(p[i]);
-+        } break;
-+        case GGML_TYPE_BF16: {
-+            const uint16_t * p = (const uint16_t *) g->data;
-+            for (int64_t i = 0; i < n; ++i) {
-+                uint32_t u = (uint32_t) p[i] << 16;
-+                float f;
-+                memcpy(&f, &u, 4);
-+                out[i] = f;
-+            }
-+        } break;
-+        case GGML_TYPE_Q8_0:
-+            dequantize_row_q8_0((const block_q8_0 *) g->data, out.data(), n);
-+            break;
-+        case GGML_TYPE_Q4_0:
-+            dequantize_row_q4_0((const block_q4_0 *) g->data, out.data(), n);
-+            break;
-+        default:
-+            GGML_ABORT("qgate: unsupported gate tensor type %d", g->type);
-+    }
-+}
-+
-+static void qgate_compute(ggml_tensor * dst, const ggml_tensor * state, const ggml_tensor * gate, const ggml_tensor * meta, int ith, int nth, void * /*userdata*/) {
-+
-+    const int64_t d2 = state->ne[0];
-+    const int64_t d  = d2 / 2;
-+    const int64_t nt = state->ne[1] > 0 ? state->ne[1] : 1;
-+
-+    const int32_t * m  = (const int32_t *) meta->data;
-+    const int k  = m[0];
-+    const int nc = m[1];
-+    const int32_t * targets  = m + 2;
-+    const int32_t * controls = m + 2 + k;
-+
-+    const int gate_dim = (int) gate->ne[0];
-+    const int g  = 1 << (k + 1);
-+    const int kb = 1 << k;
-+
-+    std::vector<float> Gbuf;
-+    qgate_dequant_gate(gate, Gbuf);
-+    const float * G = Gbuf.data();
-+    const float * src = (const float *) state->data;
-+    float       * out = (float *)       dst->data;
-+
-+    int tmask = 0;
-+    for (int j = 0; j < k; ++j) tmask |= 1 << targets[j];
-+
-+    std::vector<float> in_vec(g), out_vec(g);
-+
-+    for (int64_t t = 0; t < nt; ++t) {
-+        const float * in = src + t * d2;
-+        float       * o  = out + t * d2;
-+
-+        for (int64_t x = ith; x < d; x += nth) {
-+            if ((x & tmask) != 0) continue; // handle each block once, at its base
-+
-+            bool active = true;
-+            for (int c = 0; c < nc; ++c) {
-+                if (((x >> controls[c]) & 1) == 0) { active = false; break; }
-+            }
-+
-+            if (!active) {
-+                for (int yt = 0; yt < kb; ++yt) {
-+                    int64_t y = x;
-+                    for (int j = 0; j < k; ++j) if ((yt >> j) & 1) y |= (int64_t) 1 << targets[j];
-+                    o[y]     = in[y];
-+                    o[d + y] = in[d + y];
-+                }
-+                continue;
-+            }
-+
-+            for (int yt = 0; yt < kb; ++yt) {
-+                int64_t y = x;
-+                for (int j = 0; j < k; ++j) if ((yt >> j) & 1) y |= (int64_t) 1 << targets[j];
-+                in_vec[yt]      = in[y];
-+                in_vec[kb + yt] = in[d + y];
-+            }
-+            for (int oo = 0; oo < g; ++oo) {
-+                const float * row = G + (int64_t) oo * gate_dim;
-+                float acc = 0.0f;
-+                for (int i = 0; i < g; ++i) acc += row[i] * in_vec[i];
-+                out_vec[oo] = acc;
-+            }
-+            for (int yt = 0; yt < kb; ++yt) {
-+                int64_t y = x;
-+                for (int j = 0; j < k; ++j) if ((yt >> j) & 1) y |= (int64_t) 1 << targets[j];
-+                o[y]     = out_vec[yt];
-+                o[d + y] = out_vec[kb + yt];
-+            }
-+        }
-+    }
-+}
++// The qgate kernel itself lives in ggml (GGML_OP_QGATE: CPU in ggml-cpu/ops.cpp,
++// CUDA in ggml-cuda/qgate.cu); this file only wires the arch: hparams, tensors,
++// and a graph that emits one ggml_qgate node per gate layer.
 +
 +void llama_model_qgate::load_arch_hparams(llama_model_loader & ml) {
 +    // generic arch keys (qgate.context_length / embedding_length / block_count)
@@ -283,9 +777,7 @@ index 0000000..83420c0
 +    ggml_tensor * cur = build_inp_embd(model.tok_embd);
 +
 +    for (int il = 0; il < n_layer; ++il) {
-+        // inplace is safe: the kernel gathers each block into a local buffer
-+        // before scattering it back, and blocks are disjoint
-+        cur = ggml_map_custom3_inplace(ctx0, cur, m.qgate[il], m.qgate_meta[il], qgate_compute, GGML_N_TASKS_MAX, nullptr);
++        cur = ggml_qgate(ctx0, cur, m.qgate[il], m.qgate_meta[il]);
 +        cb(cur, "qgate_out", il);
 +    }
 +
