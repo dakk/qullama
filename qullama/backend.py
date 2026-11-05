@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import subprocess
 import tempfile
 import uuid
@@ -58,6 +59,10 @@ def run_gguf(gguf: str | Path, *, llama_embedding: str | Path | None = None,
         raise FileNotFoundError(
             f"patched llama-embedding not found at {binary} - run ./build_patched_llama.sh first"
         )
+    # make sure teh ggml libs are reachable
+    env = dict(os.environ)
+    libdir = str(binary.resolve().parent)
+    env["LD_LIBRARY_PATH"] = libdir + os.pathsep + env.get("LD_LIBRARY_PATH", "")
     proc = subprocess.run(
         [str(binary), "-m", str(gguf), "-p", prompt_token, "--embd-normalize", "-1",
          "-n", "1", "--no-warmup", "--embd-output-format", "raw",
@@ -66,23 +71,24 @@ def run_gguf(gguf: str | Path, *, llama_embedding: str | Path | None = None,
          # -np 2 stays small. -c 8 keeps the context small - context compute buffers scale
          # with n_embd x n_ctx (40 GB at 24 qubits with -c 64).
          "-np", "2", "-c", str(ctx)],
-        capture_output=True, text=True,
+        capture_output=True, text=True, env=env,
     )
+    if proc.returncode != 0:
+        tail = (proc.stderr or proc.stdout or "").strip()[-2000:]
+        raise RuntimeError(f"llama-embedding exited with code {proc.returncode}:\n{tail}")
     return parse_embedding_output(proc.stdout + proc.stderr)
 
 
 def simulate(qc, *, llama_embedding: str | Path | None = None,
              prompt_token: str = "q", keep_gguf: str | Path | None = None,
-             chunk_layers: int | None = None, dtype: str = "F32",
-             chunk_budget_bytes: int = 1 << 30) -> np.ndarray:
+             chunk_layers: int | None = None, dtype: str = "F32") -> np.ndarray:
     """Run a qiskit QuantumCircuit on patched llama.cpp; return the output statevector.
 
     The circuit starts from |0...0>. Returns a complex ndarray of length 2**qc.num_qubits.
 
     chunk_layers: if set, run the gate list in passes of this many layers (each pass
     is a separate GGUF inference; the output state feeds the next pass's embedding).
-    Off by default; mainly useful with a custom chunk_budget_bytes for very large
-    circuits on memory-constrained machines.
+    Off by default; useful for very large circuits on memory-constrained machines.
     """
     from .qiskit_io import iter_gate_ops
     from .qgate import write_qgate_gguf
@@ -164,8 +170,15 @@ class QullamaBackend:
         from qiskit.result import Result
 
         circuits = run_input if isinstance(run_input, list) else [run_input]
-        svs = [simulate(qc, llama_embedding=self._llama_embedding, prompt_token=self._prompt_token)
-               for qc in circuits]
+        sim_kwargs = {
+            "llama_embedding": self._llama_embedding,
+            "prompt_token": self._prompt_token,
+        }
+        # forward simulate() options passed as run options (e.g. dtype="Q8_0")
+        for key in ("dtype", "chunk_layers", "keep_gguf"):
+            if key in run_options:
+                sim_kwargs[key] = run_options[key]
+        svs = [simulate(qc, **sim_kwargs) for qc in circuits]
         result = Result.from_dict({
             "success": True,
             "results": [

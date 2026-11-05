@@ -10,8 +10,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import subprocess
-import sys
 from pathlib import Path
 
 import numpy as np
@@ -31,28 +29,29 @@ def cmd_to_gguf(args) -> None:
           f"-p {args.prompt_token} --embd-normalize -1 --embd-output-format raw)")
 
 
-def _parse_embedding_output(text: str) -> np.ndarray:
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("{"):
-            if line.startswith("{") and '"embedding"' in line:
-                return np.array(json.loads(line)["embedding"], dtype=np.float64)
-            continue
-        try:
-            vals = [float(x) for x in line.split()]
-        except ValueError:
-            continue
-        if len(vals) >= 2:
-            return np.array(vals, dtype=np.float64)
-    raise RuntimeError(f"could not parse llama-embedding output:\n{text[-2000:]}")
+def _require_qgate_gguf(path: Path) -> None:
+    """Exit with a clear message if path is not a readable qgate GGUF."""
+    from gguf import GGUFReader
+
+    try:
+        reader = GGUFReader(str(path))
+        field = reader.fields.get("general.architecture")
+        arch = str(field.contents()) if field is not None else None
+    except Exception as e:
+        raise SystemExit(f"error: {path} is not a readable GGUF: {e}")
+    if arch != "qgate":
+        raise SystemExit(f"error: {path} is not a qgate GGUF (general.architecture={arch!r})")
 
 
 def cmd_eval(args) -> None:
     inp = Path(args.input)
     qc = None
     if inp.suffix == ".gguf":
+        _require_qgate_gguf(inp)
         emb = run_gguf(inp, llama_embedding=args.llama_embedding, prompt_token=args.prompt_token)
         d = len(emb) // 2
+        if d < 2 or (d & (d - 1)):
+            raise SystemExit(f"error: embedding length {len(emb)} is not 2 * 2^n for any n")
         scale = math.sqrt(2 * d)
         psi_out = (emb[:d] + 1j * emb[d:]) / scale
     else:

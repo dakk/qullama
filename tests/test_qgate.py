@@ -23,6 +23,19 @@ from qullama import simulate, QullamaBackend
 from gguf import GGUFReader  # official gguf-py from PyPI
 
 
+def patched_binary_usable() -> bool:
+    "True if the patched llama-embedding exists AND can actually execute"
+    import subprocess
+
+    binary = ROOT / "llama.cpp" / "build" / "bin" / "llama-embedding"
+    if not binary.exists():
+        return False
+    try:
+        return subprocess.run([str(binary), "-h"], capture_output=True).returncode == 0
+    except OSError:
+        return False
+
+
 def test_gate_extraction():
     # bell.qasm -> transpiled to basis -> (matrix, targets, controls) per gate
     from qiskit.circuit.library import HGate, XGate
@@ -108,8 +121,9 @@ def test_end_to_end_patched_binary():
     import subprocess
 
     binary = ROOT / "llama.cpp" / "build" / "bin" / "llama-embedding"
-    if not binary.exists():
-        print("skip: patched binary not built (run ./build_patched_llama.sh) - e2e test skipped")
+    if not patched_binary_usable():
+        print("skip: patched llama-embedding not runnable here "
+              "(not built, or missing system libs like libgomp) - e2e test skipped")
         return
     qc = load_circuit_file(ROOT / "examples" / "bell.qasm")
     with tempfile.TemporaryDirectory() as td:
@@ -120,6 +134,7 @@ def test_end_to_end_patched_binary():
             [str(binary), "-m", str(gguf), "-p", "q", "--embd-normalize", "-1",
              "-n", "1", "--no-warmup", "--embd-output-format", "raw"],
             capture_output=True, text=True)
+        assert p.returncode == 0, f"llama-embedding failed: {p.stderr[-500:]}"
         line = next(l for l in p.stdout.splitlines() if l.strip() and not l.startswith("{"))
         emb = np.array([float(x) for x in line.split()])
         psi_out = (emb[:d] + 1j * emb[d:]) / math.sqrt(2 * d)
@@ -131,8 +146,8 @@ def test_end_to_end_patched_binary():
 
 def test_library_backend():
     """simulate() / QullamaBackend().run() vs qiskit Statevector on a 3-qubit circuit."""
-    if not (ROOT / "llama.cpp" / "build" / "bin" / "llama-embedding").exists():
-        print("skip: patched binary not built - library backend test skipped")
+    if not patched_binary_usable():
+        print("skip: patched binary not runnable here - library backend test skipped")
         return
     from qiskit import QuantumCircuit
 
@@ -157,8 +172,8 @@ def test_library_backend():
 
 def test_quantization_dtypes():
     """Gate-weight quantization: F32 exact, Q8_0/Q4_0/F16 close, via the real binary."""
-    if not (ROOT / "llama.cpp" / "build" / "bin" / "llama-embedding").exists():
-        print("skip: patched binary not built - quantization test skipped")
+    if not patched_binary_usable():
+        print("skip: patched binary not runnable here - quantization test skipped")
         return
     qc = load_circuit_file(ROOT / "examples" / "qft3.qasm")
     ref = statevector_reference(qc)
