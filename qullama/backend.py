@@ -28,7 +28,11 @@ import numpy as np
 
 from .qgate import build_gguf_gates
 
-DEFAULT_BINARY = Path(__file__).resolve().parent.parent / "llama.cpp" / "build" / "bin" / "llama-embedding"
+# QULLAMA_LLAMA_EMBEDDING overrides the default binary path (used by the docker)
+DEFAULT_BINARY = Path(
+    os.environ.get("QULLAMA_LLAMA_EMBEDDING")
+    or Path(__file__).resolve().parent.parent / "llama.cpp" / "build" / "bin" / "llama-embedding"
+)
 
 
 def parse_embedding_output(text: str) -> np.ndarray:

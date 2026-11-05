@@ -25,3 +25,22 @@ jobs:
 
       - name: Run tests
         run: python tests/test_qgate.py
+
+      - name: Upload patched binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-embedding-linux-x86_64
+          path: |
+            llama.cpp/build/bin/llama-embedding
+            llama.cpp/build/bin/lib*.so*
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build image
+        run: docker build -t qullama .
+
+      - name: Smoke test (bell.qasm inside the container)
+        run: docker run --rm qullama eval examples/bell.qasm

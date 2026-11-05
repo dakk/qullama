@@ -1,0 +1,8 @@
+.git
+.scratch
+venv
+llama.cpp
+__pycache__
+*.pyc
+*.gguf
+*.egg-info

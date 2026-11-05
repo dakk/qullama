@@ -40,6 +40,13 @@ python3 tests/test_qgate.py
 
 `qullama eval` prints the top measurement probabilities and the max/L2 amplitude error against qiskit's `Statevector`.
 
+## Docker usage
+
+```bash
+docker build -t qullama .
+docker run --rm qullama eval examples/bell.qasm
+```
+
 ## Library usage
 
 Build the circuit directly in Python / Qiskit and use qullama as the simulator backend (see `examples/library_demo.py`):
